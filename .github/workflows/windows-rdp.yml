@@ -1,1 +1,144 @@
+name: Windows Cloud RDP
 
+on:
+workflow_dispatch:
+
+jobs:
+build:
+runs-on: windows-latest
+timeout-minutes: 360
+
+```
+steps:
+  - name: 1. Enable Remote Desktop
+    shell: powershell
+    run: |
+      # Enable Remote Desktop
+      Set-ItemProperty `
+        -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+        -Name 'fDenyTSConnections' `
+        -Value 0
+
+      # Keep Network Level Authentication enabled
+      Set-ItemProperty `
+        -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+        -Name 'UserAuthentication' `
+        -Value 1
+
+      # Enable RDP firewall rules
+      Enable-NetFirewallRule -DisplayGroup 'Remote Desktop'
+
+  - name: 2. Create RDP User
+    shell: powershell
+    env:
+      RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+    run: |
+      $Username = 'NvDAdmin'
+
+      if ([string]::IsNullOrWhiteSpace($Env:RDP_PASSWORD)) {
+        throw 'RDP_PASSWORD secret is not configured.'
+      }
+
+      $Password = ConvertTo-SecureString `
+        $Env:RDP_PASSWORD `
+        -AsPlainText `
+        -Force
+
+      # Create user if it does not already exist
+      if (-not (Get-LocalUser -Name $Username -ErrorAction SilentlyContinue)) {
+        New-LocalUser `
+          -Name $Username `
+          -Password $Password `
+          -PasswordNeverExpires
+      }
+
+      # Ensure user is an Administrator
+      try {
+        Add-LocalGroupMember `
+          -Group 'Administrators' `
+          -Member $Username `
+          -ErrorAction Stop
+      }
+      catch {
+        Write-Host 'User is already in the Administrators group.'
+      }
+
+      Write-Host 'RDP user configured successfully.'
+
+  - name: 3. Install and Connect Tailscale
+    shell: powershell
+    env:
+      TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+    run: |
+      if ([string]::IsNullOrWhiteSpace($Env:TAILSCALE_AUTHKEY)) {
+        throw 'TAILSCALE_AUTHKEY secret is not configured.'
+      }
+
+      $MsiPath = 'C:\tailscale.msi'
+      $TailscaleExe = 'C:\Program Files\Tailscale\tailscale.exe'
+
+      # Download official Tailscale installer
+      Invoke-WebRequest `
+        'https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi' `
+        -OutFile $MsiPath
+
+      # Install silently
+      Start-Process `
+        msiexec.exe `
+        -ArgumentList "/i `"$MsiPath`" /quiet /norestart" `
+        -Wait
+
+      # Wait for installation
+      $timeout = 60
+      $elapsed = 0
+
+      while (-not (Test-Path $TailscaleExe)) {
+        Start-Sleep -Seconds 2
+        $elapsed += 2
+
+        if ($elapsed -ge $timeout) {
+          throw 'Tailscale installation timed out.'
+        }
+      }
+
+      # Connect to Tailscale
+      & $TailscaleExe up `
+        --authkey="$Env:TAILSCALE_AUTHKEY" `
+        --hostname="github-rdp-server" `
+        --accept-routes=false `
+        --accept-dns=false `
+        --reset
+
+      Start-Sleep -Seconds 5
+
+      # Get Tailscale IPv4 address
+      $TsIp = & $TailscaleExe ip -4
+
+      if ([string]::IsNullOrWhiteSpace($TsIp)) {
+        throw 'Could not obtain a Tailscale IPv4 address.'
+      }
+
+      Write-Host ''
+      Write-Host '========================================='
+      Write-Host ' RDP SERVER IS READY'
+      Write-Host '========================================='
+      Write-Host " Tailscale IP : $TsIp"
+      Write-Host ' Username     : NvDAdmin'
+      Write-Host ' Password     : Use your RDP_PASSWORD secret'
+      Write-Host '========================================='
+      Write-Host ''
+      Write-Host "Connect with Remote Desktop to: $TsIp"
+
+  - name: 4. Keep Server Alive
+    shell: powershell
+    run: |
+      $TotalMinutes = 360
+
+      for ($i = 1; $i -le $TotalMinutes; $i++) {
+        Start-Sleep -Seconds 60
+
+        if (($i % 30) -eq 0) {
+          Write-Host "Server running... $i / $TotalMinutes minutes"
+        }
+      }
+```
